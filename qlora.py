@@ -40,6 +40,7 @@ from peft import (
     get_peft_model,
     PeftModel
 )
+import peft
 from peft.tuners.lora import LoraLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
@@ -173,6 +174,10 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     bits: int = field(
         default=4,
         metadata={"help": "How many bits to use."}
+    )
+    gwq: int = field(
+        default=16,
+        metadata={"help": "bits of gwq"}
     )
     lora_r: int = field(
         default=64,
@@ -308,7 +313,18 @@ def get_accelerate_model(args, checkpoint_dir):
 
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
-    model = AutoModelForCausalLM.from_pretrained(
+    if args.bits == 16:
+        model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        cache_dir=args.cache_dir,
+        device_map=device_map,
+        max_memory=max_memory,
+        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        trust_remote_code=args.trust_remote_code,
+        use_auth_token=args.use_auth_token
+    ) 
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
         load_in_4bit=args.bits == 4,
@@ -328,6 +344,7 @@ def get_accelerate_model(args, checkpoint_dir):
         trust_remote_code=args.trust_remote_code,
         use_auth_token=args.use_auth_token
     )
+    print(model)
     if compute_dtype == torch.float16 and args.bits == 4:
         if torch.cuda.is_bf16_supported():
             print('='*80)
@@ -373,8 +390,31 @@ def get_accelerate_model(args, checkpoint_dir):
                 ),
         })
     
-    if not args.full_finetune:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+    if not args.full_finetune:  
+        if args.bits in [4, 8]:  
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)  
+        else:  
+            # For 16/32-bit models, manually handle what prepare_model_for_kbit_training does  
+            # but enable gradients for input embeddings  
+            for name, param in model.named_parameters():  
+                param.requires_grad = False  
+            
+            # Cast parameters to fp32 if needed  
+            for param in model.parameters():  
+                if (param.dtype == torch.float16) or (param.dtype == torch.bfloat16):  
+                    param.data = param.data.to(torch.float32)  
+            
+            # Enable input gradients (this is the key part that was missing)  
+            if hasattr(model, "enable_input_require_grads"):  
+                model.enable_input_require_grads()  
+            else:  
+                def make_inputs_require_grad(module, input, output):  
+                    output.requires_grad_(True)  
+                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)  
+            
+            # Enable gradient checkpointing if requested  
+            if args.gradient_checkpointing:  
+                model.gradient_checkpointing_enable()
 
     if not args.full_finetune:
         if checkpoint_dir is not None:
@@ -674,7 +714,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
 def get_last_checkpoint(checkpoint_dir):
     if isdir(checkpoint_dir):
         is_completed = exists(join(checkpoint_dir, 'completed'))
-        if is_completed: return None, True # already finished
+        # if is_completed: return None, True # already finished
         max_step = 0
         for filename in os.listdir(checkpoint_dir):
             if isdir(join(checkpoint_dir, filename)) and filename.startswith('checkpoint'):
@@ -684,6 +724,87 @@ def get_last_checkpoint(checkpoint_dir):
         print(f"Found a previous checkpoint at: {checkpoint_dir}")
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
+
+def block_int(tensor, bit, group_size):
+    tensor = tensor
+    org_shape = tensor.shape
+    tensor = tensor.reshape(-1, group_size)
+
+    grid_max = 2 ** (bit - 1)
+
+    abs_tensor = tensor.abs()
+    max_indices = abs_tensor.argmax(dim=1, keepdim=True)
+    max_values = tensor.gather(1, max_indices)
+
+    scale_magnitude = (
+        (abs_tensor.max(dim=1, keepdim=True)[0] / grid_max)
+        .to(torch.float16)
+        .to(tensor.dtype)
+    )
+
+    scales = scale_magnitude * max_values.sign()
+
+    dequant = torch.round(tensor / scales).clamp(-grid_max + 1, grid_max) * scales
+    return dequant.reshape(org_shape)
+
+
+class TweakEvery100Steps(transformers.TrainerCallback):
+    def __init__(self, bits=4, tweak_interval: int = 100):
+        super().__init__()
+        self.tweak_interval = tweak_interval
+        self.bits = bits
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        if state.global_step > 0 and state.global_step % self.tweak_interval == 0:
+            model = kwargs["model"]      
+            self.tweak_model(model, state.global_step)
+
+    def tweak_model(self, model, step: int):
+        for name, module in model.named_modules():
+            # print(name, type(module))
+            if isinstance(module, peft.tuners.lora.Linear):
+                if not hasattr(module, "original_weight"):
+                    module.register_buffer("original_weight", module.weight.data.clone())
+                gA = module.lora_A['default'].weight.grad
+                gB = module.lora_B['default'].weight.grad
+                if gA is None or gB is None:
+                    print(f"[WARN] {name} A/B grad is None, skip")
+                    continue
+                x = gA.T @ module.lora_B['default'].weight.T + module.lora_A['default'].weight.T @ gB.T
+                s = x.T.abs().mean(0)
+                best_error = float("inf")
+                best_ratio = -1
+                best_scales = None
+                n_grid = 20
+                history = []
+
+                for ratio in range(n_grid):
+                    ratio = ratio * 1 / n_grid
+                    scales = s.pow(ratio).clamp(min=1e-4)
+                    scales = scales / (scales.max() * scales.min()).sqrt()
+                    scales = scales.to(module.original_weight.device)
+                    scaled_weight = module.original_weight.data * scales.unsqueeze(0)
+                    quantized_weight = block_int(scaled_weight, self.bits, 64) # the same bit-width as qlora, see https://github.com/bitsandbytes-foundation/bitsandbytes/blob/ed9c8fca/bitsandbytes/functional.py#L889.
+                    weight = quantized_weight / scales.unsqueeze(0)
+                    loss = (
+                        (weight - module.original_weight).float().pow(2).mean().item()
+                    )
+                    history.append(loss)
+                    is_best = loss < best_error
+                    if is_best:
+                        best_error = loss
+                        best_ratio = ratio
+                        best_scales = scales
+                if best_ratio == -1:
+                    print(history)
+                    raise Exception
+                
+                print(best_ratio)
+                scaled_weight = module.original_weight.data * best_scales.unsqueeze(0)
+                quantized_weight = block_int(scaled_weight, self.bits, 64)
+                module.weight.data = quantized_weight / best_scales.unsqueeze(0)
+
+        print(f"[TweakEvery100Steps] 已在 step {step} 完成模型调整")
 
 def train():
     hfparser = transformers.HfArgumentParser((
@@ -702,7 +823,7 @@ def train():
         print('Detected that training was already completed!')
 
     model, tokenizer = get_accelerate_model(args, checkpoint_dir)
-
+    print(model)
     model.config.use_cache = False
     print('loaded model')
     set_seed(args.seed)
@@ -719,6 +840,8 @@ def train():
     # Callbacks
     if not args.full_finetune:
         trainer.add_callback(SavePeftModelCallback)
+    if args.gwq < 16:
+        trainer.add_callback(TweakEvery100Steps(args.gwq))
     if args.do_mmlu_eval:
         if args.mmlu_dataset == 'mmlu-zs':
             mmlu_dataset = load_dataset("json", data_files={
@@ -836,6 +959,15 @@ def train():
     if (args.do_train or args.do_eval or args.do_predict):
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
             fout.write(json.dumps(all_metrics))
+
+    model.eval()
+    print('loaded model')
+    set_seed(args.seed)
+     
+    import mmlu.eval_mmlu as mmlu
+    data_dir = "mmlu/data/"
+    mmlu.EvalMMLU(model.device, 0, data_dir, model, tokenizer, None)
+    mmlu.EvalMMLU(model.device, 5, data_dir, model, tokenizer, None)
 
 if __name__ == "__main__":
     train()
