@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 ## Results
 
-| rank=4 llama 7B | 5-shot |  |  |  |  | O-shot |  |  |  |  |
+| rank=4 llama 7B | 0-shot |  |  |  |  | 5-shot |  |  |  |  |
 |-----------------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|
 | group=64 MMLU   | STEM   | Hums   | Social | Other  | Avg    | STEM   | Hums   | Social | Other  | Avg    |
 | origin          | 27.3   | 33.0   | 32.4   | 37.3   | 32.6   | 30.6   | 34.1   | 38.2   | 38.2   | 35.2   |
