@@ -179,6 +179,10 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
         default=16,
         metadata={"help": "bits of gwq"}
     )
+    tweak_steps: int = field(
+        default=100,
+        metadata={"help": "bits of gwq"}
+    )
     lora_r: int = field(
         default=64,
         metadata={"help": "Lora R dimension."}
@@ -327,8 +331,8 @@ def get_accelerate_model(args, checkpoint_dir):
         model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
-        load_in_4bit=args.bits == 4,
-        load_in_8bit=args.bits == 8,
+        # load_in_4bit=args.bits == 4,
+        # load_in_8bit=args.bits == 8,
         device_map=device_map,
         max_memory=max_memory,
         quantization_config=BitsAndBytesConfig(
@@ -417,21 +421,17 @@ def get_accelerate_model(args, checkpoint_dir):
                 model.gradient_checkpointing_enable()
 
     if not args.full_finetune:
-        if checkpoint_dir is not None:
-            print("Loading adapters from checkpoint.")
-            model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
-        else:
-            print(f'adding LoRA modules...')
-            modules = find_all_linear_names(args, model)
-            config = LoraConfig(
-                r=args.lora_r,
-                lora_alpha=args.lora_alpha,
-                target_modules=modules,
-                lora_dropout=args.lora_dropout,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            model = get_peft_model(model, config)
+        print(f'adding LoRA modules...')
+        modules = find_all_linear_names(args, model)
+        config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
 
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
@@ -726,7 +726,6 @@ def get_last_checkpoint(checkpoint_dir):
     return None, False # first training
 
 def block_int(tensor, bit, group_size):
-    tensor = tensor
     org_shape = tensor.shape
     tensor = tensor.reshape(-1, group_size)
 
@@ -753,9 +752,15 @@ class TweakEvery100Steps(transformers.TrainerCallback):
         super().__init__()
         self.tweak_interval = tweak_interval
         self.bits = bits
+        assert bits < 16
 
     def on_optimizer_step(self, args, state, control, **kwargs):
-        if state.global_step > 0 and state.global_step % self.tweak_interval == 0:
+        if state.global_step > 0 and self.tweak_interval == 0:
+            model = kwargs["model"]      
+            self.tweak_model(model, state.global_step)
+            self.tweak_interval = int(1 << 31)
+
+        if state.global_step > 0 and self.tweak_interval != 0 and state.global_step % self.tweak_interval == 0:
             model = kwargs["model"]      
             self.tweak_model(model, state.global_step)
 
@@ -772,37 +777,43 @@ class TweakEvery100Steps(transformers.TrainerCallback):
                     continue
                 x = gA.T @ module.lora_B['default'].weight.T + module.lora_A['default'].weight.T @ gB.T
                 s = x.T.abs().mean(0)
-                best_error = float("inf")
-                best_ratio = -1
-                best_scales = None
-                n_grid = 20
-                history = []
+                # best_error = float("inf")
+                # best_ratio = -1
+                # best_scales = None
+                # n_grid = 20
+                # history = []
 
-                for ratio in range(n_grid):
-                    ratio = ratio * 1 / n_grid
-                    scales = s.pow(ratio).clamp(min=1e-4)
-                    scales = scales / (scales.max() * scales.min()).sqrt()
-                    scales = scales.to(module.original_weight.device)
-                    scaled_weight = module.original_weight.data * scales.unsqueeze(0)
-                    quantized_weight = block_int(scaled_weight, self.bits, 64) # the same bit-width as qlora, see https://github.com/bitsandbytes-foundation/bitsandbytes/blob/ed9c8fca/bitsandbytes/functional.py#L889.
-                    weight = quantized_weight / scales.unsqueeze(0)
-                    loss = (
-                        (weight - module.original_weight).float().pow(2).mean().item()
-                    )
-                    history.append(loss)
-                    is_best = loss < best_error
-                    if is_best:
-                        best_error = loss
-                        best_ratio = ratio
-                        best_scales = scales
-                if best_ratio == -1:
-                    print(history)
-                    raise Exception
+                # for ratio in range(n_grid):
+                #     ratio = ratio * 1 / n_grid
+                #     scales = s.pow(ratio).clamp(min=1e-4)
+                #     scales = scales / (scales.max() * scales.min()).sqrt()
+                #     scales = scales.to(module.original_weight.device)
+                #     scaled_weight = module.original_weight.data * scales.unsqueeze(0)
+                #     quantized_weight = block_int(scaled_weight, self.bits, 64)
+                #     weight = quantized_weight / scales.unsqueeze(0)
+                #     loss = (
+                #         (weight - module.original_weight).float().pow(2).mean().item()
+                #     )
+                #     history.append(loss)
+                #     is_best = loss < best_error
+                #     if is_best:
+                #         best_error = loss
+                #         best_ratio = ratio
+                #         best_scales = scales
+                # if best_ratio == -1:
+                #     print(history)
+                #     raise Exception
                 
-                print(best_ratio)
-                scaled_weight = module.original_weight.data * best_scales.unsqueeze(0)
-                quantized_weight = block_int(scaled_weight, self.bits, 64)
-                module.weight.data = quantized_weight / best_scales.unsqueeze(0)
+                # print(best_ratio, history)
+                scales = s.clamp(min=1e-4)
+                scales = scales / (scales.max() * scales.min()).sqrt()
+                scales = scales.to(module.original_weight.device)
+                scaled_weight = module.original_weight.data * scales.unsqueeze(0)
+                quantized_weight = block_int(scaled_weight, self.bits, 64)  # the same bit-width as qlora, see https://github.com/bitsandbytes-foundation/bitsandbytes/blob/ed9c8fca/bitsandbytes/functional.py#L889.
+                module.weight.data = quantized_weight / scales.unsqueeze(0)
+
+                # direct quant to mxint
+                # module.weight.data = block_int(module.weight.data, 3, 128)
 
         print(f"[TweakEvery100Steps] 已在 step {step} 完成模型调整")
 
@@ -841,7 +852,7 @@ def train():
     if not args.full_finetune:
         trainer.add_callback(SavePeftModelCallback)
     if args.gwq < 16:
-        trainer.add_callback(TweakEvery100Steps(args.gwq))
+        trainer.add_callback(TweakEvery100Steps(args.gwq, args.tweak_steps))
     if args.do_mmlu_eval:
         if args.mmlu_dataset == 'mmlu-zs':
             mmlu_dataset = load_dataset("json", data_files={

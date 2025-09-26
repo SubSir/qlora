@@ -1,6 +1,6 @@
 python -u qlora.py \
     --model_name_or_path /localssd/models/llama-7b-hf-transformers-4.29 \
-    --output_dir ./gwqlora_output \
+    --output_dir ./tweak_once_output \
     --dataset alpaca \
     --do_train True \
     --do_eval True \
@@ -26,6 +26,6 @@ python -u qlora.py \
     --lora_alpha 16 \
     --bits 16 \
     --gradient_accumulation_steps 1 \
-    --tweak_steps 100 \
+    --tweak_steps 0 \
     --gwq 3 \ 
  
