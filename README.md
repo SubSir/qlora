@@ -25,7 +25,7 @@ pip install -r requirements.txt
 | int3 tweakonce  | 29.4   | 32.0   | 33.4   | 36.2   | 32.7   | 30.2   | 33.2   | 37.4   | 38.6   | 34.7   |
 | gwq             | 29.8   | 33.3   | 34.2   | 37.7   | 33.7   | 31.3   | 33.8   | 38.3   | 39.7   | 35.6   |
 | int3-g128       | 28.4   | 31.8   | 31.3   | 35.3   | 31.8   | 28.3   | 30.5   | 31.5   | 33.3   | 30.9   |
-| 14q(3bit-g128)  | 27.8   | 29.5   | 32.1   | 33.3   | 30.6   | 31.0   | 29.3   | 33.5   | 30.4   | 31.8   |
+| l4q(3bit-g128)  | 27.8   | 29.5   | 32.1   | 33.3   | 30.6   | 31.0   | 29.3   | 33.5   | 30.4   | 31.8   |
 
 The result of l4q is taken from its original paper. I have no idea why it's worse than original int3-g128.
 
